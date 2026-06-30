@@ -1,0 +1,129 @@
+name: Build Flutter APK (Universal - FINAL FIX)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_url:
+        description: 'URL halaman release GitHub yang berisi ZIP project'
+        required: true
+      tag:
+        description: 'Tag release'
+        required: true
+      build_type:
+        description: 'debug atau release'
+        required: true
+        default: 'release'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download & extract project ZIP
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          REPO="${{ github.repository }}"
+          TAG="${{ inputs.tag }}"
+          ASSET_URL=$(curl -sL -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/releases/tags/$TAG" | \
+            python3 -c "import sys,json; d=json.load(sys.stdin); print(d['assets'][0]['url'])")
+          curl -sL -H "Authorization: token $GH_TOKEN" -H "Accept: application/octet-stream" \
+            "$ASSET_URL" -o project.zip
+          mkdir -p project_raw
+          unzip -q project.zip -d project_raw
+
+      - name: Cari pubspec.yaml
+        id: findroot
+        run: |
+          PUBSPEC=$(find project_raw -maxdepth 6 -name "pubspec.yaml" | head -n1)
+          if [ -z "$PUBSPEC" ]; then
+            echo "❌ pubspec.yaml tidak ditemukan!"
+            exit 1
+          fi
+          ROOT=$(dirname "$PUBSPEC")
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+          echo "📁 Root project: $ROOT"
+
+      - name: 🔍 Deteksi Flutter version yang cocok
+        id: flutterver
+        working-directory: ${{ steps.findroot.outputs.root }}
+        run: |
+          SDK_LINE=$(grep -E "^[[:space:]]*sdk:" pubspec.yaml | head -n1)
+          echo "SDK constraint terdeteksi: $SDK_LINE"
+          MIN_DART=$(echo "$SDK_LINE" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+          if [ -z "$MIN_DART" ]; then
+            MIN_DART="3.0.0"
+          fi
+          MAJOR=$(echo "$MIN_DART" | cut -d. -f1)
+          MINOR=$(echo "$MIN_DART" | cut -d. -f2)
+          echo "Dart SDK minimum: $MIN_DART"
+
+          if [ "$MAJOR" -ge 3 ] && [ "$MINOR" -ge 8 ]; then
+            FVER="3.32.0"
+          elif [ "$MAJOR" -ge 3 ] && [ "$MINOR" -ge 7 ]; then
+            FVER="3.29.3"
+          elif [ "$MAJOR" -ge 3 ] && [ "$MINOR" -ge 6 ]; then
+            FVER="3.27.4"
+          else
+            FVER="3.24.5"
+          fi
+          echo "✅ Flutter version dipilih: $FVER"
+          echo "version=$FVER" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.flutterver.outputs.version }}
+          channel: stable
+          cache: true
+
+      - name: 🔧 AUTO-FIX + SKIP VALIDATION
+        working-directory: ${{ steps.findroot.outputs.root }}
+        run: |
+          echo "🔧 Memperbaiki kompatibilitas..."
+
+          # FIX Android V1 Embedding
+          if [ -f "android/app/src/main/AndroidManifest.xml" ]; then
+            sed -i 's/io.flutter.app.FlutterApplication/android.app.Application/g' android/app/src/main/AndroidManifest.xml 2>/dev/null || true
+            sed -i 's/io.flutter.app.FlutterActivity/io.flutter.embedding.android.FlutterActivity/g' android/app/src/main/AndroidManifest.xml 2>/dev/null || true
+            if ! grep -q "flutterEmbedding" android/app/src/main/AndroidManifest.xml; then
+              sed -i '/<\/application>/i \        <meta-data android:name="flutterEmbedding" android:value="2" />' android/app/src/main/AndroidManifest.xml
+            fi
+          fi
+
+          # FIX minSdkVersion
+          if [ -f "android/app/build.gradle" ]; then
+            if ! grep -q "minSdkVersion" android/app/build.gradle; then
+              sed -i '/defaultConfig {/a \        minSdkVersion 21' android/app/build.gradle
+            fi
+          fi
+
+          echo "✅ Auto-fix selesai!"
+
+      - name: Flutter pub get
+        working-directory: ${{ steps.findroot.outputs.root }}
+        run: |
+          flutter pub get || { rm -rf .dart_tool; flutter pub get; }
+
+      - name: Build APK (SKIP VALIDATION)
+        working-directory: ${{ steps.findroot.outputs.root }}
+        run: |
+          echo "🚀 Memulai build..."
+          if [ "${{ inputs.build_type }}" == "debug" ]; then
+            flutter build apk --debug --android-skip-build-dependency-validation || exit 1
+          else
+            flutter build apk --release --android-skip-build-dependency-validation || exit 1
+          fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-build
+          path: ${{ steps.findroot.outputs.root }}/build/app/outputs/flutter-apk/*.apk
+          retention-days: 1
